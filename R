@@ -1,0 +1,3141 @@
+# ==============================
+# FASE 1. CARGA Y PREPARACION
+# ==============================
+
+# Instalar paquetes si no estan
+install.packages(c("sf", "terra", "tidyverse"))
+
+# Instalar si no están
+install.packages(c("gstat", "sp"))
+install.packages("spgwr")
+# Instalar si no están
+install.packages("stats")
+# Instalar paquete
+install.packages("betareg")
+install.packages(c("dplyr"))
+install.packages("GWmodel")
+install.packages("intamap")
+install.packages("devtools")
+install.packages("tmap")
+install.packages("RColorBrewer")
+
+install_local("D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/RELLENO/geospt-20260414T233210Z-3-001/geospt")
+
+library(devtools)
+library(intamap)
+library(GWmodel)
+library(sf)
+library(sp)
+library(gstat)
+library(terra)
+library(dplyr)
+library(geospt)
+library(tidyverse)
+library(betareg)
+library(spgwr)
+library(MASS)
+library(intamap)
+library(fields)
+
+ls("package:geospt")
+args(criterio.cv)
+
+# Definir ruta base
+ruta_base <- "D:/Documentos/NOVENO SEMESTRE/PROYECTO DE GRADO/"
+ruta_raw  <- paste0(ruta_base, "01_RAW_DATA/")
+
+# ------------------------------
+# 1. Cargar capas
+# ------------------------------
+limite <- st_read("D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/LIMITES/Municipios_Abril_2025_shp/Municipio, Distrito y Area no municipalizada.shp")
+
+urb_manz <- st_read("D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/MANZANA ECONOMIA/MANZANA ECONOMIA.shp")
+
+rur_sec <- st_read("D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/RURAL ECONOMIA/RURAL ECONOMIA.shp")
+
+# ------------------------------
+# 2. Filtrar Tibu
+# ------------------------------
+limite_tibu <- limite %>%
+  filter(MpCodigo == 54810)
+
+nrow(limite_tibu)
+
+# ------------------------------
+# 3. Verificar y homologar CRS
+# ------------------------------
+st_crs(limite_tibu)
+st_crs(urb_manz)
+st_crs(rur_sec)
+
+urb_manz <- st_transform(urb_manz, st_crs(limite_tibu))
+rur_sec  <- st_transform(rur_sec,  st_crs(limite_tibu))
+
+# ------------------------------
+# 4. Recortar a Tibu
+# ------------------------------
+urb_tibu <- urb_manz %>% 
+  filter(MPIO_CCDGO == "810")
+
+rur_tibu <- rur_sec %>% 
+  filter(MPIO_CCDGO == "810")
+
+nrow(urb_tibu)
+nrow(rur_tibu)
+
+
+plot(st_geometry(limite_tibu), border = "red")
+plot(st_geometry(urb_tibu), add = TRUE)
+plot(st_geometry(rur_tibu), add = TRUE)
+
+# ------------------------------
+# 5. Verificar geometrias
+# ------------------------------
+sum(!st_is_valid(urb_tibu))
+sum(!st_is_valid(rur_tibu))
+
+# Si hay geometrias invalidas, corregir
+urb_tibu <- st_make_valid(urb_tibu)
+rur_tibu <- st_make_valid(rur_tibu)
+
+# ------------------------------
+# 6. Recalcular area real desde geometria
+#    IMPORTANTE: no confiar solo en campo AREA
+# ------------------------------
+urb_tibu <- urb_tibu %>%
+  mutate(
+    area_orig = AREA,
+    area_m2   = as.numeric(st_area(.)),
+    area_km2  = area_m2 / 1e6
+  )
+
+rur_tibu <- rur_tibu %>%
+  mutate(
+    area_orig = AREA,
+    area_m2   = as.numeric(st_area(.)),
+    area_km2  = area_m2 / 1e6
+  )
+
+summary(urb_tibu$area_km2)
+summary(rur_tibu$area_km2)
+
+# Revisar areas nulas o muy pequenas
+sum(is.na(urb_tibu$area_km2))
+sum(is.na(rur_tibu$area_km2))
+
+sum(urb_tibu$area_km2 <= 0, na.rm = TRUE)
+sum(rur_tibu$area_km2 <= 0, na.rm = TRUE)
+
+# ==============================
+# FASE 2. VARIABLES BASICAS
+# ==============================
+
+# ------------------------------
+# 7. Construccion de densidades
+# ------------------------------
+
+# URBANO
+urb_tibu <- urb_tibu %>%
+  mutate(
+    dens_viv = ifelse(area_km2 > 0 & !is.na(TVIVIENDA) & TVIVIENDA >= 0,
+                      TVIVIENDA / area_km2, NA_real_),
+    dens_pers = ifelse(area_km2 > 0 & !is.na(PERSONAS_S) & PERSONAS_S >= 0,
+                       PERSONAS_S / area_km2, NA_real_)
+  )
+
+summary(urb_tibu$dens_viv)
+summary(urb_tibu$dens_pers)
+
+# RURAL
+rur_tibu <- rur_tibu %>%
+  mutate(
+    dens_pers = ifelse(area_km2 > 0 & !is.na(STP27_PERS) & STP27_PERS >= 0,
+                       STP27_PERS / area_km2, NA_real_)
+  )
+
+summary(rur_tibu$dens_pers)
+
+# ------------------------------
+# 8. Funcion de normalizacion robusta 0-1
+# ------------------------------
+norm01 <- function(x) {
+  if (all(is.na(x))) return(x)
+  rng <- range(x, na.rm = TRUE)
+  if (rng[1] == rng[2]) return(rep(0, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# ------------------------------
+# 9. Construccion de proporciones de carencia
+#    URBANO
+# ------------------------------
+urb_tibu <- urb_tibu %>%
+  mutate(
+    p_sin_acu = ifelse(TVIVIENDA > 0, TP19_ACU_2 / TVIVIENDA, NA_real_),
+    p_sin_alc = ifelse(TVIVIENDA > 0, TP19_ALC_2 / TVIVIENDA, NA_real_),
+    p_sin_ee  = ifelse(TVIVIENDA > 0, TP19_EE_2  / TVIVIENDA, NA_real_),
+    p_sin_rec = ifelse(TVIVIENDA > 0, TP19_RECB2 / TVIVIENDA, NA_real_),
+    p_sin_gas = ifelse(TVIVIENDA > 0, TP19_GAS_2 / TVIVIENDA, NA_real_),
+    p_sin_int = ifelse(TVIVIENDA > 0, TP19_INTE2 / TVIVIENDA, NA_real_)
+  )
+
+# ------------------------------
+# 10. Construccion de proporciones de carencia
+#     RURAL
+# ------------------------------
+rur_tibu <- rur_tibu %>%
+  mutate(
+    p_sin_acu = ifelse(STVIVIENDA > 0, STP19_ACU2 / STVIVIENDA, NA_real_),
+    p_sin_alc = ifelse(STVIVIENDA > 0, STP19_ALC2 / STVIVIENDA, NA_real_),
+    p_sin_ee  = ifelse(STVIVIENDA > 0, STP19_EE_2 / STVIVIENDA, NA_real_),
+    p_sin_rec = ifelse(STVIVIENDA > 0, STP19_REC2 / STVIVIENDA, NA_real_),
+    p_sin_gas = ifelse(STVIVIENDA > 0, STP19_GAS2 / STVIVIENDA, NA_real_),
+    p_sin_int = ifelse(STVIVIENDA > 0, STP19_INT2 / STVIVIENDA, NA_real_)
+  )
+
+# ------------------------------
+# 11. Forzar coherencia 0-1 en proporciones
+#     (si hubiera errores >1 o <0 se vuelven NA)
+# ------------------------------
+vars_ise <- c("p_sin_acu", "p_sin_alc", "p_sin_ee", "p_sin_rec", "p_sin_gas", "p_sin_int")
+
+for (v in vars_ise) {
+  urb_tibu[[v]] <- ifelse(urb_tibu[[v]] < 0 | urb_tibu[[v]] > 1, NA_real_, urb_tibu[[v]])
+  rur_tibu[[v]] <- ifelse(rur_tibu[[v]] < 0 | rur_tibu[[v]] > 1, NA_real_, rur_tibu[[v]])
+}
+
+# Revisar resumen de proporciones urbanas
+summary(urb_tibu[, vars_ise])
+
+# Revisar resumen de proporciones rurales
+summary(rur_tibu[, vars_ise])
+
+# ------------------------------
+# 12. Contar variables validas por fila
+#     y construir ISE_raw con minimo 4 de 6 variables
+# ------------------------------
+urb_tibu$n_valid_ise <- rowSums(!is.na(st_drop_geometry(urb_tibu[, vars_ise])))
+rur_tibu$n_valid_ise <- rowSums(!is.na(st_drop_geometry(rur_tibu[, vars_ise])))
+
+urb_tibu$ISE_raw <- ifelse(
+  urb_tibu$n_valid_ise >= 4,
+  rowMeans(st_drop_geometry(urb_tibu[, vars_ise]), na.rm = TRUE),
+  NA_real_
+)
+
+rur_tibu$ISE_raw <- ifelse(
+  rur_tibu$n_valid_ise >= 4,
+  rowMeans(st_drop_geometry(rur_tibu[, vars_ise]), na.rm = TRUE),
+  NA_real_
+)
+
+summary(urb_tibu$ISE_raw)
+summary(rur_tibu$ISE_raw)
+
+# ------------------------------
+# 13. Normalizacion final del ISE
+# ------------------------------
+urb_tibu <- urb_tibu %>%
+  mutate(
+    zona = "urbano",
+    ISE  = norm01(ISE_raw)
+  )
+
+rur_tibu <- rur_tibu %>%
+  mutate(
+    zona = "rural",
+    ISE  = norm01(ISE_raw)
+  )
+
+summary(urb_tibu$ISE)
+summary(rur_tibu$ISE)
+
+# ------------------------------
+# 14. Construir variable de exposicion unificada
+#     Urbano = densidad de viviendas
+#     Rural  = densidad de personas
+# ------------------------------
+urb_tibu <- urb_tibu %>%
+  mutate(expo_base = dens_viv)
+
+rur_tibu <- rur_tibu %>%
+  mutate(expo_base = dens_pers)
+
+summary(urb_tibu$expo_base)
+summary(rur_tibu$expo_base)
+
+# ------------------------------
+# 15. Unificar urbano + rural
+# ------------------------------
+urb_muni <- urb_tibu %>%
+  transmute(
+    zona,
+    area_km2,
+    expo_base,
+    dens_viv,
+    dens_pers,
+    ISE,
+    ISE_raw,
+    n_valid_ise,
+    geometry
+  )
+
+rur_muni <- rur_tibu %>%
+  transmute(
+    zona,
+    area_km2,
+    expo_base,
+    dens_viv = NA_real_,
+    dens_pers,
+    ISE,
+    ISE_raw,
+    n_valid_ise,
+    geometry
+  )
+
+muni_base <- bind_rows(urb_muni, rur_muni)
+
+# ------------------------------
+# 16. Verificaciones finales
+# ------------------------------
+table(muni_base$zona)
+
+summary(muni_base$expo_base)
+summary(muni_base$dens_viv)
+summary(muni_base$dens_pers)
+summary(muni_base$ISE)
+
+# Conteo de NA por variable
+colSums(is.na(st_drop_geometry(muni_base)))
+
+
+# ------------------------------
+# 18. Revisar faltantes del ISE
+# ------------------------------
+colSums(is.na(st_drop_geometry(urb_tibu[, c(vars_ise, "ISE_raw", "ISE")])))
+colSums(is.na(st_drop_geometry(rur_tibu[, c(vars_ise, "ISE_raw", "ISE")])))
+
+# ==============================
+# PRODUCTO FINAL FASE 2
+# muni_base = capa base municipal con:
+# - zona
+# - area_km2
+# - expo_base
+# - dens_viv
+# - dens_pers
+# - ISE
+# ==============================
+
+#RESULTADOS IMPORTANTES
+summary(urb_tibu$area_km2)
+summary(rur_tibu$area_km2)
+
+summary(urb_tibu$dens_viv)
+summary(urb_tibu$dens_pers)
+summary(rur_tibu$dens_pers)
+
+summary(urb_tibu$ISE_raw)
+summary(rur_tibu$ISE_raw)
+
+summary(urb_tibu$ISE)
+summary(rur_tibu$ISE)
+
+colSums(is.na(st_drop_geometry(urb_tibu[, c(vars_ise, "ISE_raw", "ISE")])))
+colSums(is.na(st_drop_geometry(rur_tibu[, c(vars_ise, "ISE_raw", "ISE")])))
+
+
+table(urb_manz$MPIO_CCDGO)
+table(rur_sec$MPIO_CCDGO)
+
+unique(urb_manz$MPIO_CCDGO)
+unique(rur_sec$MPIO_CCDGO)
+
+# ==============================
+# 19. TRANSFORMACION LOGARITMICA DE EXPOSICION
+# ==============================
+
+# Urbano: exposicion principal = densidad de vivienda
+urb_tibu <- urb_tibu %>%
+  mutate(
+    log_dens_viv  = log(dens_viv + 1),
+    log_dens_pers = log(dens_pers + 1)
+  )
+
+# Rural: exposicion principal = densidad de personas
+rur_tibu <- rur_tibu %>%
+  mutate(
+    log_dens_pers = log(dens_pers + 1)
+  )
+
+# Variable municipal unificada para exposicion
+muni_base <- muni_base %>%
+  mutate(
+    log_expo = log(expo_base + 1)
+  )
+
+# Revisar resultados
+summary(urb_tibu$log_dens_viv)
+summary(urb_tibu$log_dens_pers)
+summary(rur_tibu$log_dens_pers)
+summary(muni_base$log_expo)
+
+plot(density(muni_base$log_expo))
+
+# ==============================
+# FASE 3: VARIABLES FISICAS
+# OPCION C: indice fisico solo con distancia a rios
+# ==============================
+
+# 1. Cargar rios
+rios <- st_read("D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/RIOS/Rios_Tibú.shp")
+
+# 2. Homologar CRS
+rios <- st_transform(rios, st_crs(limite_tibu))
+
+# 3. Convertir limite a terra
+limite_vect <- terra::vect(limite_tibu)
+
+# 4. Cargar MDE y recortarlo a Tibú
+mde <- terra::rast("D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/MDE/MODELO DIGITAL DE ELEVACION.tif")
+
+# Homologar CRS del MDE al del límite
+mde <- terra::project(mde, st_crs(limite_tibu)$wkt)
+
+# Recortar y enmascarar a Tibú
+mde_tibu <- terra::crop(mde, limite_vect)
+mde_tibu <- terra::mask(mde_tibu, limite_vect)
+
+# 5. Convertir rios a raster
+rios_vect <- terra::vect(rios)
+
+rios_rast <- terra::rasterize(
+  rios_vect,
+  mde_tibu,
+  field = 1,
+  touches = TRUE,
+  filename = "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/rios_rast.tif",
+  overwrite = TRUE
+)
+
+# 6. Distancia a rios
+dist_rios <- terra::distance(
+  rios_rast,
+  filename = "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/dist_rios.tif",
+  overwrite = TRUE
+)
+
+plot(dist_rios)
+
+# 7. Extraer distancia a rios a centroides de muni_base
+cent_muni <- st_centroid(muni_base)
+xy <- st_coordinates(cent_muni)
+
+pts <- terra::vect(
+  data.frame(x = xy[,1], y = xy[,2]),
+  geom = c("x", "y"),
+  crs = st_crs(muni_base)$wkt
+)
+
+muni_base$dist_rios <- terra::extract(dist_rios, pts)[,2]
+
+# 8. Normalizar e invertir
+muni_base <- muni_base %>%
+  mutate(
+    dist_norm = norm01(dist_rios),
+    dist_inv = 1 - dist_norm,
+    indice_fisico = dist_inv
+  )
+
+# 9. Revisar resultados
+summary(muni_base$dist_rios)
+summary(muni_base$dist_norm)
+summary(muni_base$dist_inv)
+summary(muni_base$indice_fisico)
+colSums(is.na(muni_base[, c("dist_rios", "indice_fisico")]))
+hist(muni_base$indice_fisico)
+
+
+#==================================================
+    #FASE 4: KRIGING - BOX COX
+#==================================================
+# ------------------------------------------------------------
+# 1. REVISAR VARIABLE ORIGINAL
+# ------------------------------------------------------------
+
+summary(muni_base$expo_base)
+sum(is.na(muni_base$expo_base))
+min(muni_base$expo_base, na.rm = TRUE)
+
+# ------------------------------------------------------------
+# 2. TRANSFORMACION BOX-COX
+# ------------------------------------------------------------
+# Box-Cox exige valores estrictamente positivos.
+# Si expo_base tiene ceros, se suma un desplazamiento.
+
+min_expo <- min(muni_base$expo_base, na.rm = TRUE)
+
+bc_shift <- ifelse(min_expo <= 0, abs(min_expo) + 1, 0)
+
+muni_base <- muni_base %>%
+  mutate(
+    expo_pos = expo_base + bc_shift
+  )
+
+summary(muni_base$expo_pos)
+min(muni_base$expo_pos, na.rm = TRUE)
+
+# Estimar lambda óptimo con Box-Cox
+bc_model <- lm(expo_pos ~ 1, data = muni_base)
+
+bc <- MASS::boxcox(
+  bc_model,
+  lambda = seq(-2, 2, by = 0.01),
+  plotit = TRUE
+)
+
+lambda_bc <- bc$x[which.max(bc$y)]
+lambda_bc
+
+# Función Box-Cox
+boxcox_transform <- function(x, lambda) {
+  if (abs(lambda) < 1e-6) {
+    return(log(x))
+  } else {
+    return((x^lambda - 1) / lambda)
+  }
+}
+
+# Función inversa Box-Cox
+boxcox_inverse <- function(z, lambda) {
+  if (abs(lambda) < 1e-6) {
+    return(exp(z))
+  } else {
+    return((lambda * z + 1)^(1 / lambda))
+  }
+}
+
+# Crear variable transformada
+muni_base <- muni_base %>%
+  mutate(
+    expo_bc = boxcox_transform(expo_pos, lambda_bc)
+  )
+
+summary(muni_base$expo_bc)
+sum(is.na(muni_base$expo_bc))
+
+# Histograma y densidad para revisar mejora
+hist(muni_base$expo_bc,
+     main = "Histograma - expo_base transformada Box-Cox",
+     xlab = "expo_bc",
+     col = "gray")
+
+plot(density(muni_base$expo_bc, na.rm = TRUE),
+     main = "Densidad - expo_bc",
+     xlab = "expo_bc")
+# ------------------------------------------------------------
+# 3. CREAR CENTROIDES Y PREPARAR PUNTOS
+# ------------------------------------------------------------
+
+cent_muni <- st_centroid(muni_base)
+
+pts_krig <- cent_muni %>%
+  filter(!is.na(expo_bc))
+
+nrow(pts_krig)
+
+coords_pts <- st_coordinates(pts_krig)
+
+pts_krig <- pts_krig %>%
+  mutate(
+    x = coords_pts[, 1],
+    y = coords_pts[, 2]
+  )
+
+pts_sp <- as(pts_krig, "Spatial")
+
+plot(st_geometry(limite_tibu), border = "red",
+     main = "Puntos de muestreo para kriging - Box-Cox")
+plot(st_geometry(pts_krig), add = TRUE, pch = 20, cex = 0.5)
+
+# ------------------------------------------------------------
+# 4. ANALISIS DE TENDENCIA ESPACIAL
+# ------------------------------------------------------------
+
+modelo_tend_bc <- lm(expo_bc ~ x + y, data = pts_krig)
+summary(modelo_tend_bc)
+
+par(mfrow = c(1, 2))
+
+plot(pts_krig$x, pts_krig$expo_bc,
+     xlab = "Coordenada X",
+     ylab = "expo_bc",
+     main = "Tendencia de expo_bc en X",
+     pch = 20)
+abline(lm(expo_bc ~ x, data = pts_krig), col = "red", lwd = 2)
+
+plot(pts_krig$y, pts_krig$expo_bc,
+     xlab = "Coordenada Y",
+     ylab = "expo_bc",
+     main = "Tendencia de expo_bc en Y",
+     pch = 20)
+abline(lm(expo_bc ~ y, data = pts_krig), col = "red", lwd = 2)
+
+par(mfrow = c(1, 1))
+
+# ------------------------------------------------------------
+# 5. SEMIVARIOGRAMA EXPERIMENTAL ISOTROPICO
+# ------------------------------------------------------------
+
+vg_exp_bc <- variogram(expo_bc ~ 1, data = pts_sp)
+
+plot(vg_exp_bc,
+     main = "Semivariograma experimental isotropico - Box-Cox")
+
+# ------------------------------------------------------------
+# 6. SEMIVARIOGRAMAS DIRECCIONALES
+# ------------------------------------------------------------
+
+vg_dir_bc <- variogram(
+  expo_bc ~ 1,
+  data = pts_sp,
+  alpha = c(0, 45, 90, 135)
+)
+
+plot(vg_dir_bc,
+     main = "Semivariogramas direccionales - Box-Cox")
+
+# ------------------------------------------------------------
+# 7. ESTIMACION DE ANISOTROPIA CON INTAMAP
+# ------------------------------------------------------------
+
+obs_sf_bc <- pts_krig[, c("expo_bc", "geometry")]
+
+# Crear grilla de predicción
+grd_sf <- st_make_grid(
+  limite_tibu,
+  cellsize = 500,
+  what = "centers"
+)
+
+grd_sf <- st_sf(geometry = grd_sf)
+
+# Usar unión del límite por seguridad
+limite_union <- st_union(limite_tibu)
+
+grd_sf <- grd_sf[
+  st_within(grd_sf, limite_union, sparse = FALSE)[, 1],
+]
+
+coords_grd <- st_coordinates(grd_sf)
+
+grd_sf$x <- coords_grd[, 1]
+grd_sf$y <- coords_grd[, 2]
+
+grd_sp <- as(grd_sf, "Spatial")
+
+obj_intamap_bc <- createIntamapObject(
+  observations = obs_sf_bc,
+  predictionLocations = grd_sf,
+  targetCRS = st_crs(limite_tibu)$wkt,
+  class = "automap"
+)
+
+obj_intamap_bc <- preProcess(obj_intamap_bc)
+obj_intamap_bc <- estimateParameters(obj_intamap_bc)
+
+obj_intamap_bc$anisPar
+obj_intamap_bc$variogramModel
+obj_intamap_bc$sampleVariogram
+
+# Extraer anisotropia
+angulo_anis_bc <- obj_intamap_bc$anisPar$direction
+ratio_anis_bc  <- obj_intamap_bc$anisPar$ratio
+
+# Ajustar para gstat
+angulo_anis_bc <- angulo_anis_bc %% 180
+
+ratio_anis_bc <- ifelse(
+  ratio_anis_bc > 1,
+  1 / ratio_anis_bc,
+  ratio_anis_bc
+)
+
+angulo_anis_bc
+ratio_anis_bc
+
+plot(obj_intamap_bc$sampleVariogram,
+     main = "Semivariograma experimental - intamap Box-Cox")
+# ------------------------------------------------------------
+# 8. FUNCIONES PARA AJUSTE DE MODELOS VARIOGRAFICOS
+# ------------------------------------------------------------
+
+ajustar_variogramas_anis <- function(vg_exp, ini_psill, ini_range, ini_nugget,
+                                     angulo_anis, ratio_anis) {
+  
+  resultados <- list()
+  tabla <- data.frame()
+  
+  modelos <- c("Exp", "Gau", "Sph")
+  
+  for (m in modelos) {
+    
+    fit <- tryCatch({
+      fit.variogram(
+        vg_exp,
+        vgm(
+          psill = ini_psill,
+          model = m,
+          range = ini_range,
+          nugget = ini_nugget,
+          anis = c(angulo_anis, ratio_anis)
+        )
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit)) {
+      SSE <- attr(fit, "SSErr")
+      
+      if (!is.null(SSE) && is.finite(SSE)) {
+        resultados[[m]] <- fit
+        
+        tabla <- rbind(
+          tabla,
+          data.frame(
+            modelo = m,
+            kappa = NA,
+            SSErr = SSE
+          )
+        )
+      }
+    }
+  }
+  
+  kappas <- c(0.5, 1.0, 1.5, 2.0)
+  
+  for (k in kappas) {
+    
+    fit <- tryCatch({
+      fit.variogram(
+        vg_exp,
+        vgm(
+          psill = ini_psill,
+          model = "Mat",
+          range = ini_range,
+          nugget = ini_nugget,
+          kappa = k,
+          anis = c(angulo_anis, ratio_anis)
+        )
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit)) {
+      SSE <- attr(fit, "SSErr")
+      
+      if (!is.null(SSE) && is.finite(SSE)) {
+        nombre <- paste0("Mat_k", k)
+        resultados[[nombre]] <- fit
+        
+        tabla <- rbind(
+          tabla,
+          data.frame(
+            modelo = "Mat",
+            kappa = k,
+            SSErr = SSE
+          )
+        )
+      }
+    }
+  }
+  
+  if (nrow(tabla) > 0) {
+    tabla <- tabla[order(tabla$SSErr), ]
+  }
+  
+  return(list(tabla = tabla, resultados = resultados))
+}
+
+obtener_fit_anis <- function(tabla_mejor, lista_fits) {
+  
+  m <- tabla_mejor$modelo[1]
+  k <- tabla_mejor$kappa[1]
+  
+  if (is.na(k)) {
+    nombre <- m
+  } else {
+    nombre <- paste0(m, "_k", k)
+  }
+  
+  lista_fits[[nombre]]
+}
+
+# Para modelos no anisotrópicos del kriging probabilístico
+ajustar_variogramas <- function(vg_exp, ini_psill, ini_range, ini_nugget) {
+  
+  resultados <- list()
+  tabla <- data.frame()
+  
+  modelos <- c("Exp", "Gau", "Sph", "Cir")
+  
+  for (m in modelos) {
+    
+    fit <- tryCatch({
+      fit.variogram(
+        vg_exp,
+        vgm(
+          psill = ini_psill,
+          model = m,
+          range = ini_range,
+          nugget = ini_nugget
+        )
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit)) {
+      SSE <- attr(fit, "SSErr")
+      
+      if (!is.null(SSE) && is.finite(SSE)) {
+        resultados[[m]] <- fit
+        
+        tabla <- rbind(
+          tabla,
+          data.frame(
+            modelo = m,
+            kappa = NA,
+            SSErr = SSE
+          )
+        )
+      }
+    }
+  }
+  
+  kappas <- c(0.3, 0.5, 1.0, 1.5, 2.0)
+  
+  for (k in kappas) {
+    
+    fit <- tryCatch({
+      fit.variogram(
+        vg_exp,
+        vgm(
+          psill = ini_psill,
+          model = "Mat",
+          range = ini_range,
+          nugget = ini_nugget,
+          kappa = k
+        )
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit)) {
+      SSE <- attr(fit, "SSErr")
+      
+      if (!is.null(SSE) && is.finite(SSE)) {
+        nombre <- paste0("Mat_k", k)
+        resultados[[nombre]] <- fit
+        
+        tabla <- rbind(
+          tabla,
+          data.frame(
+            modelo = "Mat",
+            kappa = k,
+            SSErr = SSE
+          )
+        )
+      }
+    }
+  }
+  
+  if (nrow(tabla) > 0) {
+    tabla <- tabla[order(tabla$SSErr), ]
+  }
+  
+  return(list(tabla = tabla, resultados = resultados))
+}
+
+obtener_fit <- function(tabla_mejor, lista_fits) {
+  
+  m <- tabla_mejor$modelo[1]
+  k <- tabla_mejor$kappa[1]
+  
+  if (is.na(k)) {
+    nombre <- m
+  } else {
+    nombre <- paste0(m, "_k", k)
+  }
+  
+  lista_fits[[nombre]]
+}
+
+# ------------------------------------------------------------
+# 9. AJUSTE DE MODELOS ANISOTROPICOS BOX-COX
+# ------------------------------------------------------------
+
+ini_psill_bc  <- var(pts_krig$expo_bc, na.rm = TRUE)
+ini_range_bc  <- 5000
+ini_nugget_bc <- 0
+
+ajustes_bc_anis <- ajustar_variogramas_anis(
+  vg_exp = vg_exp_bc,
+  ini_psill = ini_psill_bc,
+  ini_range = ini_range_bc,
+  ini_nugget = ini_nugget_bc,
+  angulo_anis = angulo_anis_bc,
+  ratio_anis = ratio_anis_bc
+)
+
+comparacion_bc_anis <- ajustes_bc_anis$tabla
+comparacion_bc_anis
+
+mejor_bc_anis <- comparacion_bc_anis[1, ]
+mejor_bc_anis
+
+vg_fit_bc_anis <- obtener_fit_anis(
+  mejor_bc_anis,
+  ajustes_bc_anis$resultados
+)
+
+vg_fit_bc_anis
+attr(vg_fit_bc_anis, "SSErr")
+
+# ------------------------------------------------------------
+# 10. GRAFICAR AJUSTES
+# ------------------------------------------------------------
+
+names(ajustes_bc_anis$resultados)
+
+if ("Exp" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Exp"]],
+       main = "Box-Cox - Modelo Exponencial")
+}
+
+if ("Gau" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Gau"]],
+       main = "Box-Cox - Modelo Gaussiano")
+}
+
+if ("Sph" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Sph"]],
+       main = "Box-Cox - Modelo Esférico")
+}
+
+if ("Mat_k0.5" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Mat_k0.5"]],
+       main = "Box-Cox - Modelo Matérn k = 0.5")
+}
+
+if ("Mat_k1" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Mat_k1"]],
+       main = "Box-Cox - Modelo Matérn k = 1.0")
+}
+
+if ("Mat_k1.5" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Mat_k1.5"]],
+       main = "Box-Cox - Modelo Matérn k = 1.5")
+}
+
+if ("Mat_k2" %in% names(ajustes_bc_anis$resultados)) {
+  plot(vg_exp_bc, ajustes_bc_anis$resultados[["Mat_k2"]],
+       main = "Box-Cox - Modelo Matérn k = 2.0")
+}
+
+plot(
+  vg_exp_bc,
+  vg_fit_bc_anis,
+  main = paste(
+    "Mejor semivariograma Box-Cox -",
+    mejor_bc_anis$modelo,
+    ifelse(is.na(mejor_bc_anis$kappa), "", paste("k =", mejor_bc_anis$kappa))
+  )
+)
+
+# ------------------------------------------------------------
+# 11. VALIDACION CRUZADA KRIGING BOX-COX
+# ------------------------------------------------------------
+
+cv_bc_anis <- krige.cv(
+  formula = expo_bc ~ 1,
+  locations = pts_sp,
+  model = vg_fit_bc_anis
+)
+
+# Criterio del profesor Carlos Eduardo Melo
+criteria_cv_bc_anis <- criterio.cv(cv_bc_anis)
+criteria_cv_bc_anis
+
+# Métricas simples adicionales
+res_bc_cv <- cv_bc_anis$var1.pred - cv_bc_anis$observed
+
+resumen_cv_bc_anis <- data.frame(
+  variable = "expo_bc",
+  metodo = "OK_anis_BoxCox",
+  lambda = lambda_bc,
+  shift = bc_shift,
+  modelo = mejor_bc_anis$modelo,
+  kappa = mejor_bc_anis$kappa,
+  bias = mean(res_bc_cv, na.rm = TRUE),
+  rmse = sqrt(mean(res_bc_cv^2, na.rm = TRUE)),
+  mae = mean(abs(res_bc_cv), na.rm = TRUE),
+  MPE = criteria_cv_bc_anis$MPE,
+  ASEPE = criteria_cv_bc_anis$ASEPE,
+  RMSPE = criteria_cv_bc_anis$RMSPE,
+  MSPE = criteria_cv_bc_anis$MSPE,
+  RMSSPE = criteria_cv_bc_anis$RMSSPE,
+  MAPPE = criteria_cv_bc_anis$MAPPE,
+  CCPE = criteria_cv_bc_anis$CCPE,
+  R2 = criteria_cv_bc_anis$R2,
+  pseudoR2 = criteria_cv_bc_anis$pseudoR2,
+  SSErr_variograma = attr(vg_fit_bc_anis, "SSErr")
+)
+
+resumen_cv_bc_anis
+
+plot(cv_bc_anis$observed, cv_bc_anis$var1.pred,
+     xlab = "Observado Box-Cox",
+     ylab = "Predicho Box-Cox",
+     main = "Validación cruzada - Kriging Box-Cox",
+     pch = 20)
+abline(0, 1, col = "red", lwd = 2)
+
+# ------------------------------------------------------------
+# 12. KRIGING PROBABILISTICO CON UMBRAL ORIGINAL P75
+# ------------------------------------------------------------
+# El umbral se define en la escala original y luego se transforma a Box-Cox.
+
+umbral_original <- quantile(pts_krig$expo_base, 0.75, na.rm = TRUE)
+umbral_original
+
+umbral_bc <- boxcox_transform(umbral_original + bc_shift, lambda_bc)
+umbral_bc
+
+pts_krig <- pts_krig %>%
+  mutate(
+    ind_high = ifelse(expo_base > umbral_original, 1, 0)
+  )
+
+table(pts_krig$ind_high)
+
+pts_sp <- as(pts_krig, "Spatial")
+
+vg_exp_prob <- variogram(ind_high ~ 1, data = pts_sp)
+
+plot(vg_exp_prob,
+     main = "Semivariograma experimental - Indicator Kriging Box-Cox")
+
+ini_psill_prob  <- var(pts_krig$ind_high, na.rm = TRUE)
+ini_range_prob  <- 5000
+ini_nugget_prob <- 0
+
+ajustes_prob <- ajustar_variogramas(
+  vg_exp = vg_exp_prob,
+  ini_psill = ini_psill_prob,
+  ini_range = ini_range_prob,
+  ini_nugget = ini_nugget_prob
+)
+
+comparacion_prob <- ajustes_prob$tabla
+comparacion_prob
+
+mejor_prob <- comparacion_prob %>% slice(1)
+mejor_prob
+
+vg_fit_prob <- obtener_fit(mejor_prob, ajustes_prob$resultados)
+
+plot(vg_exp_prob, vg_fit_prob,
+     main = paste("Mejor modelo probabilístico Box-Cox -",
+                  mejor_prob$modelo,
+                  ifelse(is.na(mejor_prob$kappa), "",
+                         paste("k =", mejor_prob$kappa))))
+
+cv_prob <- krige.cv(
+  formula = ind_high ~ 1,
+  locations = pts_sp,
+  model = vg_fit_prob
+)
+
+cv_prob_pred <- pmin(pmax(cv_prob$var1.pred, 0), 1)
+
+resumen_cv_prob <- data.frame(
+  metodo = "PK_indicator_BoxCox",
+  bias = mean(cv_prob$residual, na.rm = TRUE),
+  rmse = sqrt(mean(cv_prob$residual^2, na.rm = TRUE)),
+  mae  = mean(abs(cv_prob$residual), na.rm = TRUE),
+  brier = mean((cv_prob$observed - cv_prob_pred)^2, na.rm = TRUE)
+)
+
+resumen_cv_prob
+
+# Comparación con kriging ordinario Box-Cox convertido a probabilidad
+p_ok_bc <- 1 - pnorm(
+  q = umbral_bc,
+  mean = cv_bc_anis$var1.pred,
+  sd = sqrt(pmax(cv_bc_anis$var1.var, 1e-9))
+)
+
+obs_bin_ok <- ifelse(cv_bc_anis$observed > umbral_bc, 1, 0)
+
+comparacion_brier <- bind_rows(
+  data.frame(
+    metodo = "OK_BoxCox_prob_exceed",
+    brier = mean((obs_bin_ok - p_ok_bc)^2, na.rm = TRUE)
+  ),
+  data.frame(
+    metodo = "PK_indicator_BoxCox",
+    brier = resumen_cv_prob$brier
+  )
+)
+
+comparacion_brier
+
+# Kriging probabilístico final
+krig_prob_final <- krige(
+  formula = ind_high ~ 1,
+  locations = pts_sp,
+  newdata = grd_sp,
+  model = vg_fit_prob
+)
+
+krig_prob_sf <- st_as_sf(krig_prob_final)
+
+coords_prob <- st_coordinates(krig_prob_sf)
+
+krig_prob_df <- krig_prob_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = coords_prob[, 1],
+    y = coords_prob[, 2]
+  )
+
+r_prob <- terra::rast(
+  krig_prob_df[, c("x", "y", "var1.pred")],
+  type = "xyz",
+  crs = st_crs(limite_tibu)$wkt
+)
+
+r_prob <- clamp(r_prob, lower = 0, upper = 1, values = TRUE)
+
+limite_vect <- terra::vect(limite_tibu)
+
+r_prob <- terra::mask(
+  terra::crop(r_prob, limite_vect),
+  limite_vect
+)
+
+plot(r_prob,
+     main = paste("Probabilidad P(expo_base >", round(umbral_original, 2), ")"))
+plot(limite_vect, add = TRUE)
+
+summary(values(r_prob))
+
+# ------------------------------------------------------------
+# 13. KRIGING FINAL ANISOTROPICO BOX-COX
+# ------------------------------------------------------------
+
+krig_bc_anis <- krige(
+  formula = expo_bc ~ 1,
+  locations = pts_sp,
+  newdata = grd_sp,
+  model = vg_fit_bc_anis
+)
+
+krig_bc_sf <- st_as_sf(krig_bc_anis)
+
+coords_krig_bc <- st_coordinates(krig_bc_sf)
+
+krig_bc_df <- krig_bc_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = coords_krig_bc[, 1],
+    y = coords_krig_bc[, 2]
+  )
+
+r_pred_bc <- terra::rast(
+  krig_bc_df[, c("x", "y", "var1.pred")],
+  type = "xyz",
+  crs = st_crs(limite_tibu)$wkt
+)
+
+r_var_bc <- terra::rast(
+  krig_bc_df[, c("x", "y", "var1.var")],
+  type = "xyz",
+  crs = st_crs(limite_tibu)$wkt
+)
+
+r_pred_bc <- terra::mask(
+  terra::crop(r_pred_bc, limite_vect),
+  limite_vect
+)
+
+r_var_bc <- terra::mask(
+  terra::crop(r_var_bc, limite_vect),
+  limite_vect
+)
+
+# Recorte visual en escala Box-Cox
+q_bc <- quantile(
+  values(r_pred_bc),
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+r_pred_bc_rec <- clamp(
+  r_pred_bc,
+  lower = q_bc[1],
+  upper = q_bc[2],
+  values = TRUE
+)
+
+# Antitransformación Box-Cox a escala original
+if (abs(lambda_bc) < 1e-6) {
+  r_pred_original_bc <- exp(r_pred_bc) - bc_shift
+} else {
+  r_pred_original_bc <- ((lambda_bc * r_pred_bc + 1)^(1 / lambda_bc)) - bc_shift
+}
+
+# Evitar negativos después de antitransformar
+r_pred_original_bc <- clamp(
+  r_pred_original_bc,
+  lower = 0,
+  values = TRUE
+)
+
+# Recorte visual escala original
+q_original_bc <- quantile(
+  values(r_pred_original_bc),
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+r_pred_original_bc_rec <- clamp(
+  r_pred_original_bc,
+  lower = q_original_bc[1],
+  upper = q_original_bc[2],
+  values = TRUE
+)
+
+# Mapas kriging Box-Cox
+plot(r_pred_bc,
+     main = "Kriging anisotropico - Box-Cox")
+plot(limite_vect, add = TRUE)
+
+plot(r_var_bc,
+     main = "Varianza del kriging - Box-Cox")
+plot(limite_vect, add = TRUE)
+
+plot(r_pred_bc_rec,
+     main = "Kriging anisotropico - Box-Cox recortado")
+plot(limite_vect, add = TRUE)
+
+plot(r_pred_original_bc_rec,
+     main = "Kriging Box-Cox antitransformado - escala original")
+plot(limite_vect, add = TRUE)
+
+# ------------------------------------------------------------
+# 14. FUNCION DE BASE RADIAL (RBF) CON OPTIMIZACION DE ETA Y RHO
+# VERSION CORREGIDA CON MEDIA BASE
+# ------------------------------------------------------------
+# RBF Gaussiana:
+# K(d) = exp(-(d / rho)^2)
+#
+# rho = escala espacial
+# eta = regularizacion / suavizamiento
+#
+# Esta versión centra la variable en la media:
+# y_c = y - mean(y)
+# pred = mean(y) + K %*% pesos
+#
+# Esto evita que la superficie tienda artificialmente a cero
+# en zonas alejadas de puntos de muestreo.
+
+# ------------------------------------------------------------
+# 14.1. Preparar datos
+# ------------------------------------------------------------
+
+coords_rbf <- as.matrix(st_coordinates(pts_krig))
+y_rbf <- pts_krig$expo_bc
+
+summary(y_rbf)
+
+# ------------------------------------------------------------
+# 14.2. Funciones auxiliares RBF
+# ------------------------------------------------------------
+
+dist_mat <- function(A, B) {
+  sqrt(
+    outer(A[, 1], B[, 1], "-")^2 +
+      outer(A[, 2], B[, 2], "-")^2
+  )
+}
+
+rbf_kernel <- function(D, rho) {
+  exp(- (D / rho)^2)
+}
+
+ajustar_rbf <- function(coords_train, y_train, rho, eta) {
+  
+  media_y <- mean(y_train, na.rm = TRUE)
+  y_centrado <- y_train - media_y
+  
+  D <- dist_mat(coords_train, coords_train)
+  K <- rbf_kernel(D, rho)
+  
+  K_reg <- K + diag(eta, nrow(K))
+  
+  pesos <- tryCatch(
+    solve(K_reg, y_centrado),
+    error = function(e) NULL
+  )
+  
+  if (is.null(pesos)) {
+    return(NULL)
+  }
+  
+  list(
+    coords_train = coords_train,
+    pesos = pesos,
+    rho = rho,
+    eta = eta,
+    media_y = media_y
+  )
+}
+
+predecir_rbf <- function(modelo, coords_new) {
+  
+  D_new <- dist_mat(coords_new, modelo$coords_train)
+  K_new <- rbf_kernel(D_new, modelo$rho)
+  
+  as.numeric(modelo$media_y + K_new %*% modelo$pesos)
+}
+
+# ------------------------------------------------------------
+# 14.3. Grilla de eta y rho
+# ------------------------------------------------------------
+
+rho_values <- c(250, 500, 750, 1000, 1500, 2000, 3000, 5000)
+
+eta_values <- c(1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1)
+
+param_grid <- expand.grid(
+  rho = rho_values,
+  eta = eta_values
+)
+
+# ------------------------------------------------------------
+# 14.4. Validación cruzada 5-fold
+# ------------------------------------------------------------
+
+set.seed(123)
+
+kfold <- 5
+folds <- sample(rep(1:kfold, length.out = nrow(pts_krig)))
+
+resultados_rbf <- data.frame()
+
+for (i in 1:nrow(param_grid)) {
+  
+  rho_i <- param_grid$rho[i]
+  eta_i <- param_grid$eta[i]
+  
+  pred_cv <- rep(NA_real_, nrow(pts_krig))
+  
+  for (f in 1:kfold) {
+    
+    train_idx <- which(folds != f)
+    test_idx  <- which(folds == f)
+    
+    coords_train <- coords_rbf[train_idx, , drop = FALSE]
+    y_train <- y_rbf[train_idx]
+    
+    coords_test <- coords_rbf[test_idx, , drop = FALSE]
+    
+    mod_f <- ajustar_rbf(
+      coords_train = coords_train,
+      y_train = y_train,
+      rho = rho_i,
+      eta = eta_i
+    )
+    
+    if (!is.null(mod_f)) {
+      pred_cv[test_idx] <- predecir_rbf(
+        modelo = mod_f,
+        coords_new = coords_test
+      )
+    }
+  }
+  
+  res_cv <- pred_cv - y_rbf
+  
+  resultados_rbf <- rbind(
+    resultados_rbf,
+    data.frame(
+      metodo = "RBF_Gauss_BoxCox_5fold_media",
+      variable = "expo_bc",
+      rho = rho_i,
+      eta = eta_i,
+      bias = mean(res_cv, na.rm = TRUE),
+      rmse = sqrt(mean(res_cv^2, na.rm = TRUE)),
+      mae = mean(abs(res_cv), na.rm = TRUE),
+      n_pred = sum(!is.na(pred_cv))
+    )
+  )
+}
+
+resultados_rbf <- resultados_rbf %>%
+  arrange(rmse)
+
+resultados_rbf
+
+mejor_rbf <- resultados_rbf[1, ]
+
+mejor_rbf
+
+rho_final <- mejor_rbf$rho
+eta_final <- mejor_rbf$eta
+
+rho_final
+eta_final
+
+# ------------------------------------------------------------
+# 14.5. Ajuste final con mejores parámetros
+# ------------------------------------------------------------
+
+rbf_model <- ajustar_rbf(
+  coords_train = coords_rbf,
+  y_train = y_rbf,
+  rho = rho_final,
+  eta = eta_final
+)
+
+if (is.null(rbf_model)) {
+  stop("El modelo RBF final no pudo ajustarse.")
+}
+
+# ------------------------------------------------------------
+# 14.6. Validación final
+# ------------------------------------------------------------
+
+pred_rbf_cv <- rep(NA_real_, nrow(pts_krig))
+
+for (f in 1:kfold) {
+  
+  train_idx <- which(folds != f)
+  test_idx  <- which(folds == f)
+  
+  coords_train <- coords_rbf[train_idx, , drop = FALSE]
+  y_train <- y_rbf[train_idx]
+  
+  coords_test <- coords_rbf[test_idx, , drop = FALSE]
+  
+  mod_f <- ajustar_rbf(
+    coords_train = coords_train,
+    y_train = y_train,
+    rho = rho_final,
+    eta = eta_final
+  )
+  
+  pred_rbf_cv[test_idx] <- predecir_rbf(
+    modelo = mod_f,
+    coords_new = coords_test
+  )
+}
+
+res_rbf_cv <- pred_rbf_cv - y_rbf
+
+resumen_cv_rbf <- data.frame(
+  metodo = "RBF_Gauss_BoxCox_5fold_media",
+  variable = "expo_bc",
+  lambda = lambda_bc,
+  rho = rho_final,
+  eta = eta_final,
+  bias = mean(res_rbf_cv, na.rm = TRUE),
+  rmse = sqrt(mean(res_rbf_cv^2, na.rm = TRUE)),
+  mae = mean(abs(res_rbf_cv), na.rm = TRUE)
+)
+
+resumen_cv_rbf
+
+plot(
+  y_rbf,
+  pred_rbf_cv,
+  xlab = "Observado Box-Cox",
+  ylab = "Predicho RBF Box-Cox",
+  main = paste0(
+    "Validación 5-fold RBF Box-Cox con media\n",
+    "rho = ", rho_final,
+    " | eta = ", eta_final
+  ),
+  pch = 20
+)
+
+abline(0, 1, col = "red", lwd = 2)
+
+# ------------------------------------------------------------
+# 14.7. Predicción sobre grilla
+# ------------------------------------------------------------
+
+coords_rbf_pred <- as.matrix(coords_grd)
+
+pred_rbf_grid <- predecir_rbf(
+  modelo = rbf_model,
+  coords_new = coords_rbf_pred
+)
+
+rbf_df <- data.frame(
+  x = coords_grd[, 1],
+  y = coords_grd[, 2],
+  pred_rbf_bc = pred_rbf_grid
+)
+
+r_pred_rbf_bc <- terra::rast(
+  rbf_df[, c("x", "y", "pred_rbf_bc")],
+  type = "xyz",
+  crs = st_crs(limite_tibu)$wkt
+)
+
+r_pred_rbf_bc <- terra::mask(
+  terra::crop(r_pred_rbf_bc, limite_vect),
+  limite_vect
+)
+
+# ------------------------------------------------------------
+# 14.8. Recorte solo visual
+# ------------------------------------------------------------
+
+q_rbf_bc <- quantile(
+  terra::values(r_pred_rbf_bc),
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+r_pred_rbf_bc_rec <- terra::clamp(
+  r_pred_rbf_bc,
+  lower = q_rbf_bc[1],
+  upper = q_rbf_bc[2],
+  values = TRUE
+)
+
+# ------------------------------------------------------------
+# 14.9. Mapas
+# ------------------------------------------------------------
+
+plot(
+  r_pred_rbf_bc,
+  main = paste0(
+    "RBF Box-Cox optimizado con media\n",
+    "rho = ", rho_final,
+    " | eta = ", eta_final
+  )
+)
+
+plot(limite_vect, add = TRUE)
+
+plot(
+  r_pred_rbf_bc_rec,
+  main = "RBF Box-Cox optimizado con media - recorte visual"
+)
+
+plot(limite_vect, add = TRUE)
+
+# ------------------------------------------------------------
+# 14.10. Resultados
+# ------------------------------------------------------------
+
+summary(terra::values(r_pred_rbf_bc))
+summary(terra::values(r_pred_rbf_bc_rec))
+
+cat("\nMejores parámetros:\n")
+print(mejor_rbf)
+
+cat("\nResumen validación final:\n")
+print(resumen_cv_rbf)
+
+cat("\nResumen raster RBF Box-Cox:\n")
+print(summary(terra::values(r_pred_rbf_bc)))
+
+cat("\nResumen raster RBF Box-Cox recortado:\n")
+print(summary(terra::values(r_pred_rbf_bc_rec)))
+
+# ------------------------------------------------------------
+# 15. IDW CON VARIABLE BOX-COX
+# ------------------------------------------------------------
+# IDW se usa como interpolador determinístico de comparación.
+# Se evalúan varios valores del parámetro de potencia idp.
+
+# Asegurar que pts_krig tiene expo_bc y geometría
+summary(pts_krig$expo_bc)
+sum(is.na(pts_krig$expo_bc))
+
+# ------------------------------------------------------------
+# 15.1. VALIDACIÓN 5-FOLD PARA IDW
+# ------------------------------------------------------------
+
+set.seed(123)
+
+kfold <- 5
+folds_idw <- sample(rep(1:kfold, length.out = nrow(pts_krig)))
+
+idp_values <- c(1, 1.5, 2, 2.5, 3)
+
+resultados_idw <- data.frame()
+
+for (idp_i in idp_values) {
+  
+  pred_idw_cv <- rep(NA, nrow(pts_krig))
+  
+  for (f in 1:kfold) {
+    
+    train_idx <- which(folds_idw != f)
+    test_idx  <- which(folds_idw == f)
+    
+    train_sp <- as(pts_krig[train_idx, ], "Spatial")
+    test_sp  <- as(pts_krig[test_idx, ], "Spatial")
+    
+    pred_f <- gstat::idw(
+      formula = expo_bc ~ 1,
+      locations = train_sp,
+      newdata = test_sp,
+      idp = idp_i,
+      debug.level = 0
+    )
+    
+    pred_idw_cv[test_idx] <- pred_f$var1.pred
+  }
+  
+  obs_idw <- pts_krig$expo_bc
+  
+  res_idw <- pred_idw_cv - obs_idw
+  
+  resultados_idw <- rbind(
+    resultados_idw,
+    data.frame(
+      metodo = paste0("IDW_BoxCox_idp_", idp_i),
+      idp = idp_i,
+      bias = mean(res_idw, na.rm = TRUE),
+      rmse = sqrt(mean(res_idw^2, na.rm = TRUE)),
+      mae = mean(abs(res_idw), na.rm = TRUE)
+    )
+  )
+}
+
+resultados_idw
+
+# ------------------------------------------------------------
+# 15.2. SELECCIONAR MEJOR IDW
+# ------------------------------------------------------------
+
+resultados_idw <- resultados_idw[order(resultados_idw$rmse), ]
+
+mejor_idw <- resultados_idw[1, ]
+mejor_idw
+
+idp_final <- mejor_idw$idp
+idp_final
+
+# ------------------------------------------------------------
+# 15.3. IDW FINAL SOBRE LA GRILLA
+# ------------------------------------------------------------
+
+idw_final <- gstat::idw(
+  formula = expo_bc ~ 1,
+  locations = pts_sp,
+  newdata = grd_sp,
+  idp = idp_final,
+  debug.level = 0
+)
+
+idw_sf <- st_as_sf(idw_final)
+
+coords_idw <- st_coordinates(idw_sf)
+
+idw_df <- idw_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = coords_idw[, 1],
+    y = coords_idw[, 2]
+  )
+
+r_pred_idw_bc <- terra::rast(
+  idw_df[, c("x", "y", "var1.pred")],
+  type = "xyz",
+  crs = st_crs(limite_tibu)$wkt
+)
+
+r_pred_idw_bc <- terra::mask(
+  terra::crop(r_pred_idw_bc, limite_vect),
+  limite_vect
+)
+
+# ------------------------------------------------------------
+# 15.4. RECORTE VISUAL IDW EN ESCALA BOX-COX
+# ------------------------------------------------------------
+
+q_idw_bc <- quantile(
+  values(r_pred_idw_bc),
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+r_pred_idw_bc_rec <- clamp(
+  r_pred_idw_bc,
+  lower = q_idw_bc[1],
+  upper = q_idw_bc[2],
+  values = TRUE
+)
+
+plot(r_pred_idw_bc,
+     main = paste("IDW Box-Cox - idp =", idp_final))
+plot(limite_vect, add = TRUE)
+
+plot(r_pred_idw_bc_rec,
+     main = paste("IDW Box-Cox recortado - idp =", idp_final))
+plot(limite_vect, add = TRUE)
+
+
+summary(values(r_pred_idw_bc))
+
+# ------------------------------------------------------------
+# 16. COMPARACION FINAL DE INTERPOLADORES
+# Kriging Box-Cox vs RBF Box-Cox vs IDW Box-Cox
+# ------------------------------------------------------------
+
+res_krig_cv <- cv_bc_anis$var1.pred - cv_bc_anis$observed
+
+comp_kriging <- data.frame(
+  metodo = "Kriging_BoxCox",
+  bias = mean(res_krig_cv, na.rm = TRUE),
+  rmse = sqrt(mean(res_krig_cv^2, na.rm = TRUE)),
+  mae = mean(abs(res_krig_cv), na.rm = TRUE)
+)
+
+comp_rbf <- resumen_cv_rbf[, c("metodo", "bias", "rmse", "mae")]
+
+comp_idw <- mejor_idw[, c("metodo", "bias", "rmse", "mae")]
+
+comparacion_interpoladores <- rbind(
+  comp_kriging,
+  comp_rbf,
+  comp_idw
+)
+
+comparacion_interpoladores <- comparacion_interpoladores[
+  order(comparacion_interpoladores$rmse),
+]
+
+comparacion_interpoladores
+
+# ------------------------------------------------------------
+# 17. RESUMENES DE RASTER
+# ------------------------------------------------------------
+
+summary(terra::values(r_pred_bc))
+summary(terra::values(r_var_bc))
+summary(terra::values(r_pred_bc_rec))
+summary(terra::values(r_pred_original_bc))
+summary(terra::values(r_pred_original_bc_rec))
+summary(terra::values(r_pred_rbf_bc))
+summary(terra::values(r_pred_rbf_original))
+summary(terra::values(r_prob))
+
+#=========================================
+#RESULTADO
+#=========================================
+lambda_bc
+comparacion_bc_anis
+mejor_bc_anis
+vg_fit_bc_anis
+criteria_cv_bc_anis
+resumen_cv_bc_anis
+comparacion_brier
+resumen_cv_rbf
+comparacion_interpoladores
+summary(values(r_pred_bc))
+summary(values(r_pred_original_bc))
+
+
+#==================================================
+         #FASE 5: MODELOS ESTADÍSTICOS (GAMMA Y BETA)
+#==================================================
+
+#==================================================
+    #MODELO GAMMA
+#==================================================
+# Filtrar datos válidos
+data_gamma <- muni_base %>%
+  st_drop_geometry() %>%
+  filter(
+    !is.na(expo_base),
+    expo_base > 0,
+    !is.na(indice_fisico),
+    !is.na(ISE)
+  )
+
+# Convertir zona a factor
+data_gamma$zona <- as.factor(data_gamma$zona)
+
+modelo_gamma <- glm(
+  expo_base ~ indice_fisico + ISE + zona,
+  family = Gamma(link = "log"),
+  data = data_gamma
+)
+
+summary(modelo_gamma)
+
+# ------------------------------------------
+# ANOVA (Chi-cuadrado - recomendado)
+# ------------------------------------------
+anova(modelo_gamma, test = "Chisq")
+
+# ------------------------------------------
+# ANOVA tipo F (opcional, algunos profesores lo piden)
+# ------------------------------------------
+anova(modelo_gamma, test = "F")
+
+# ------------------------------------------
+# COMPARACIÓN CON MODELO NULO
+# ------------------------------------------
+modelo_gamma_null <- glm(
+  expo_base ~ 1,
+  family = Gamma(link = "log"),
+  data = data_gamma
+)
+
+anova(modelo_gamma_null, modelo_gamma, test = "Chisq")
+
+pseudoR2_gamma <- 1 - modelo_gamma$deviance / modelo_gamma$null.deviance
+pseudoR2_gamma
+
+muni_base <- muni_base %>%
+  mutate(id = row_number())
+
+data_gamma <- muni_base %>%
+  st_drop_geometry() %>%
+  filter(
+    !is.na(expo_base),
+    expo_base > 0,
+    !is.na(indice_fisico),
+    !is.na(ISE)
+  )
+
+data_gamma$residuos <- residuals(modelo_gamma, type = "deviance")
+
+muni_res <- muni_base %>%
+  left_join(
+    data_gamma %>% dplyr::select(id, residuos),
+    by = "id"
+  )
+
+summary(muni_res$residuos)
+sum(is.na(muni_res$residuos))
+
+
+plot(
+  muni_res["residuos"],
+  main = "Residuos Modelo Gamma"
+)
+
+library(RColorBrewer)
+
+pal <- colorRampPalette(rev(brewer.pal(11, "RdBu")))
+
+plot(
+  muni_res["residuos"],
+  col = pal(100),
+  main = "Residuos Modelo Gamma"
+)
+
+q_res <- quantile(
+  muni_res$residuos,
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+muni_res$res_clip <- pmin(
+  pmax(muni_res$residuos, q_res[1]),
+  q_res[2]
+)
+
+plot(
+  muni_res["res_clip"],
+  col = pal(100),
+  main = "Residuos Modelo Gamma"
+)
+
+
+library(tmap)
+
+tm_shape(muni_res) +
+  tm_fill(
+    "res_clip",
+    palette = "-RdBu",
+    title = "Residuos",
+    style = "quantile"
+  ) +
+  tm_borders() +
+  tm_layout(
+    title = "Residuos Modelo Gamma",
+    legend.outside = TRUE
+  )
+
+
+par(mfrow = c(2,2))
+plot(modelo_gamma)
+par(mfrow = c(1,1))
+
+#==============================================
+# MODELO BETA CON BOX-COX
+#==============================================
+
+library(sf)
+library(dplyr)
+library(betareg)
+library(lmtest)
+
+# ------------------------------------------------------------
+# 0. VERIFICAR QUE EXISTA expo_bc
+# ------------------------------------------------------------
+# expo_bc debe venir de la fase Box-Cox:
+# expo_base -> expo_pos -> expo_bc
+
+if (!"expo_bc" %in% names(muni_base)) {
+  stop("No existe la variable expo_bc en muni_base. Primero debes correr la transformación Box-Cox.")
+}
+
+summary(muni_base$expo_bc)
+sum(is.na(muni_base$expo_bc))
+
+# ------------------------------------------------------------
+# 1. CREAR ID PARA UNIR RESIDUOS DESPUÉS
+# ------------------------------------------------------------
+# Esto evita errores al unir por ISE o por expo_base, porque pueden existir valores repetidos.
+
+muni_base <- muni_base %>%
+  mutate(id_beta = dplyr::row_number())
+
+# ------------------------------------------------------------
+# 2. PREPARAR DATOS PARA MODELO BETA
+# ------------------------------------------------------------
+# El modelo Beta necesita que la variable respuesta esté en (0,1).
+# ISE_beta ajusta ISE para evitar valores exactamente 0 o 1.
+
+data_beta <- muni_base %>%
+  st_drop_geometry() %>%
+  filter(
+    !is.na(ISE),
+    !is.na(indice_fisico),
+    !is.na(expo_bc)
+  ) %>%
+  mutate(
+    ISE_beta = (ISE * (n() - 1) + 0.5) / n()
+  )
+
+summary(data_beta$ISE)
+summary(data_beta$ISE_beta)
+summary(data_beta$indice_fisico)
+summary(data_beta$expo_bc)
+
+# Verificar rango válido de ISE_beta
+range(data_beta$ISE_beta, na.rm = TRUE)
+
+# ------------------------------------------------------------
+# 3. MODELO BETA CON BOX-COX
+# ------------------------------------------------------------
+
+modelo_beta <- betareg(
+  ISE_beta ~ indice_fisico + expo_bc,
+  data = data_beta
+)
+
+summary(modelo_beta)
+
+# ------------------------------------------------------------
+# 4. MODELO NULO Y TEST DE RAZÓN DE VEROSIMILITUD
+# ------------------------------------------------------------
+
+modelo_beta_null <- betareg(
+  ISE_beta ~ 1,
+  data = data_beta
+)
+
+# Comparación formal
+lmtest::lrtest(modelo_beta, modelo_beta_null)
+
+# ------------------------------------------------------------
+# 5. EXTRAER AJUSTADOS Y RESIDUOS
+# ------------------------------------------------------------
+
+data_beta$fitted_beta <- fitted(modelo_beta)
+
+# Residuos cuantílicos, recomendados para betareg
+data_beta$res_beta <- residuals(modelo_beta, type = "quantile")
+
+summary(data_beta$res_beta)
+
+# ------------------------------------------------------------
+# 6. GRÁFICO OBSERVADO VS AJUSTADO
+# ------------------------------------------------------------
+
+plot(
+  data_beta$ISE_beta,
+  data_beta$fitted_beta,
+  pch = 16,
+  col = "blue",
+  main = "Observado vs Ajustado (Modelo Beta - Box-Cox)",
+  xlab = "ISE observado ajustado (ISE_beta)",
+  ylab = "ISE ajustado"
+)
+
+abline(0, 1, col = "red", lwd = 2)
+
+# ------------------------------------------------------------
+# 7. RESIDUOS VS AJUSTADOS
+# ------------------------------------------------------------
+
+plot(
+  data_beta$fitted_beta,
+  data_beta$res_beta,
+  pch = 16,
+  col = "darkgreen",
+  main = "Residuos vs Ajustados (Modelo Beta - Box-Cox)",
+  xlab = "Valores ajustados",
+  ylab = "Residuos cuantílicos"
+)
+
+abline(h = 0, col = "red", lwd = 2)
+
+# ------------------------------------------------------------
+# 8. UNIR RESIDUOS A LA CAPA ESPACIAL
+# ------------------------------------------------------------
+
+muni_beta_res <- muni_base %>%
+  left_join(
+    data_beta %>%
+      dplyr::select(id_beta, fitted_beta, res_beta),
+    by = "id_beta"
+  )
+
+# ------------------------------------------------------------
+# 9. MAPA DE RESIDUOS
+# ------------------------------------------------------------
+
+plot(
+  muni_beta_res["res_beta"],
+  main = "Residuos Modelo Beta - Box-Cox"
+)
+
+# ------------------------------------------------------------
+# 10. DIAGNÓSTICOS DEL MODELO
+# ------------------------------------------------------------
+
+par(mfrow = c(2, 2))
+plot(modelo_beta)
+par(mfrow = c(1, 1))
+
+# ------------------------------------------------------------
+# 11. TABLAS PARA EL DOCUMENTO
+# ------------------------------------------------------------
+
+# Coeficientes del modelo de media
+coef_beta <- as.data.frame(summary(modelo_beta)$coefficients$mean)
+coef_beta
+
+# Parámetro phi
+phi_beta <- as.data.frame(summary(modelo_beta)$coefficients$precision)
+phi_beta
+
+# Medidas generales
+medidas_beta <- data.frame(
+  Log_likelihood = as.numeric(logLik(modelo_beta)),
+  pseudo_R2 = summary(modelo_beta)$pseudo.r.squared,
+  iteraciones = modelo_beta$optim$counts[1]
+)
+
+medidas_beta
+
+# Comparación modelo beta vs nulo
+test_beta <- lmtest::lrtest(modelo_beta, modelo_beta_null)
+test_beta
+
+# Resumen residuos
+resumen_res_beta <- data.frame(
+  minimo = min(data_beta$res_beta, na.rm = TRUE),
+  Q1 = quantile(data_beta$res_beta, 0.25, na.rm = TRUE),
+  mediana = median(data_beta$res_beta, na.rm = TRUE),
+  media = mean(data_beta$res_beta, na.rm = TRUE),
+  Q3 = quantile(data_beta$res_beta, 0.75, na.rm = TRUE),
+  maximo = max(data_beta$res_beta, na.rm = TRUE)
+)
+
+resumen_res_beta
+
+# ------------------------------------------------------------
+# 12. RESULTADOS 
+#================================
+summary(modelo_beta)
+lmtest::lrtest(modelo_beta, modelo_beta_null)
+summary(data_beta$res_beta)
+coef_beta
+phi_beta
+medidas_beta
+resumen_res_beta
+
+#==============================================
+# MODELO GWR CON BOX-COX
+#==============================================
+
+library(sf)
+library(sp)
+library(dplyr)
+library(GWmodel)
+
+# ------------------------------------------------------------
+# 0. VERIFICAR VARIABLE BOX-COX
+# ------------------------------------------------------------
+
+if (!"expo_bc" %in% names(muni_base)) {
+  stop("No existe expo_bc en muni_base. Primero debes correr la transformación Box-Cox.")
+}
+
+summary(muni_base$expo_bc)
+sum(is.na(muni_base$expo_bc))
+
+# ------------------------------------------------------------
+# 1. PREPARAR DATOS PARA GWR
+# ------------------------------------------------------------
+# Se trabaja con centroides porque GWR requiere geometría tipo punto.
+
+muni_base <- muni_base %>%
+  mutate(id_gwr = dplyr::row_number())
+
+cent_gwr <- st_centroid(muni_base)
+
+data_gwr <- cent_gwr %>%
+  filter(
+    !is.na(expo_bc),
+    !is.na(indice_fisico),
+    !is.na(ISE)
+  )
+
+nrow(data_gwr)
+
+# Convertir a Spatial
+data_gwr_sp <- as(data_gwr, "Spatial")
+
+# ------------------------------------------------------------
+# 2. MODELO GLOBAL OLS DE REFERENCIA
+# ------------------------------------------------------------
+# Este modelo sirve para comparar contra GWR.
+
+modelo_global <- lm(
+  expo_bc ~ indice_fisico + ISE,
+  data = st_drop_geometry(data_gwr)
+)
+
+summary(modelo_global)
+AIC(modelo_global)
+
+# ------------------------------------------------------------
+# 3. SELECCIÓN DEL ANCHO DE BANDA
+# ------------------------------------------------------------
+# Se usa bandwidth adaptativo porque las unidades espaciales no están distribuidas
+# de manera homogénea en todo el territorio.
+
+bw_gw <- bw.gwr(
+  formula = expo_bc ~ indice_fisico + ISE,
+  data = data_gwr_sp,
+  approach = "CV",
+  kernel = "bisquare",
+  adaptive = TRUE
+)
+
+bw_gw
+
+# ------------------------------------------------------------
+# 4. AJUSTE DEL MODELO GWR
+# ------------------------------------------------------------
+
+gwr_model <- gwr.basic(
+  formula = expo_bc ~ indice_fisico + ISE,
+  data = data_gwr_sp,
+  bw = bw_gw,
+  kernel = "bisquare",
+  adaptive = TRUE,
+  F123.test = TRUE
+)
+
+summary(gwr_model)
+
+# Diagnósticos principales
+gwr_model$GW.diagnostic
+
+# Pruebas F, si el objeto las genera
+gwr_model$Ftests
+
+# ------------------------------------------------------------
+# 5. CONVERTIR RESULTADOS A SF
+# ------------------------------------------------------------
+
+gwr_sf <- st_as_sf(gwr_model$SDF)
+
+names(gwr_sf)
+
+# ------------------------------------------------------------
+# 6. RESUMEN DE COEFICIENTES LOCALES
+# ------------------------------------------------------------
+
+summary(gwr_sf$indice_fisico)
+summary(gwr_sf$ISE)
+
+# Buscar nombre de R2 local
+r2_col <- grep("R2|Local", names(gwr_sf), value = TRUE)
+r2_col
+
+# Si aparece Local_R2, usarlo:
+if ("Local_R2" %in% names(gwr_sf)) {
+  summary(gwr_sf$Local_R2)
+}
+
+# ------------------------------------------------------------
+# 7. COMPARACIÓN MODELO GLOBAL VS GWR
+# ------------------------------------------------------------
+
+comparacion_gwr <- data.frame(
+  modelo = c("OLS_global", "GWR_BoxCox"),
+  R2 = c(
+    summary(modelo_global)$r.squared,
+    gwr_model$GW.diagnostic$gw.R2
+  ),
+  R2_ajustado = c(
+    summary(modelo_global)$adj.r.squared,
+    gwr_model$GW.diagnostic$gwR2.adj
+  ),
+  AIC = c(
+    AIC(modelo_global),
+    gwr_model$GW.diagnostic$AIC
+  ),
+  AICc = c(
+    NA,
+    gwr_model$GW.diagnostic$AICc
+  )
+)
+
+comparacion_gwr
+
+# ------------------------------------------------------------
+# 8. MAPAS DE COEFICIENTES LOCALES
+# ------------------------------------------------------------
+
+plot(
+  gwr_sf["indice_fisico"],
+  main = "Coeficiente local GWR - Índice físico"
+)
+
+plot(
+  st_geometry(limite_tibu),
+  add = TRUE,
+  border = "black",
+  lwd = 1
+)
+
+plot(
+  gwr_sf["ISE"],
+  main = "Coeficiente local GWR - ISE"
+)
+
+plot(
+  st_geometry(limite_tibu),
+  add = TRUE,
+  border = "black",
+  lwd = 1
+)
+
+if ("Local_R2" %in% names(gwr_sf)) {
+  plot(
+    gwr_sf["Local_R2"],
+    main = "R² local del modelo GWR"
+  )
+  
+  plot(
+    st_geometry(limite_tibu),
+    add = TRUE,
+    border = "black",
+    lwd = 1
+  )
+}
+
+# ------------------------------------------------------------
+# 9. RESIDUOS GWR
+# ------------------------------------------------------------
+
+# Buscar columna de residuos
+res_col <- grep("residual|Residual", names(gwr_sf), value = TRUE)
+res_col
+
+# Normalmente se llama residual
+if ("residual" %in% names(gwr_sf)) {
+  plot(
+    gwr_sf["residual"],
+    main = "Residuos del modelo GWR - Box-Cox"
+  )
+  
+  plot(
+    st_geometry(limite_tibu),
+    add = TRUE,
+    border = "black",
+    lwd = 1
+  )
+}
+
+# ------------------------------------------------------------
+# 10. GUARDAR RESULTADOS
+# ------------------------------------------------------------
+
+st_write(
+  gwr_sf,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/gwr_boxcox_resultados.gpkg",
+  delete_dsn = TRUE
+)
+
+# ------------------------------------------------------------
+# 11. RESULTADOS FINALES
+# ------------------------------------------------------------
+
+summary(modelo_global)
+bw_gw
+gwr_model$GW.diagnostic
+comparacion_gwr
+summary(gwr_sf$indice_fisico)
+summary(gwr_sf$ISE)
+summary(gwr_sf$Local_R2)
+
+
+#=========================================================
+# FASE 7: VULNERABILIDAD TOTAL
+# AJUSTADA CON EXPOSICIÓN RBF - BOX COX
+# SIN ANTITRANSFORMAR
+#=========================================================
+
+#---------------------------------------------------------
+# 0. FUNCIÓN DE NORMALIZACIÓN 0 - 1
+#---------------------------------------------------------
+
+norm01 <- function(x) {
+  r <- range(x, na.rm = TRUE)
+  
+  if (!is.finite(r[1]) || !is.finite(r[2])) {
+    return(rep(NA_real_, length(x)))
+  }
+  
+  if ((r[2] - r[1]) == 0) {
+    return(rep(0.5, length(x)))
+  }
+  
+  (x - r[1]) / (r[2] - r[1])
+}
+
+#---------------------------------------------------------
+# 1. DEFINIR RASTER FINAL DE EXPOSICIÓN
+#---------------------------------------------------------
+# IMPORTANTE:
+# Para vulnerabilidad se usa la superficie RBF en escala Box-Cox,
+# SIN antitransformar.
+#
+# Se recomienda usar r_pred_rbf_bc sin recorte para conservar variabilidad.
+# Luego se hace control de extremos sobre los valores extraídos.
+
+if (!exists("r_pred_rbf_bc")) {
+  stop("No existe r_pred_rbf_bc. Primero debes correr la interpolación RBF con Box-Cox.")
+}
+
+raster_expo_final <- r_pred_rbf_bc
+
+plot(
+  raster_expo_final,
+  main = "Exposición RBF Box-Cox - sin antitransformar"
+)
+
+plot(
+  terra::vect(limite_tibu),
+  add = TRUE
+)
+
+summary(values(raster_expo_final))
+
+#---------------------------------------------------------
+# 2. EXTRAER VALORES DEL RASTER A LAS UNIDADES ESPACIALES
+#---------------------------------------------------------
+
+cent_muni <- st_centroid(muni_base)
+
+xy <- st_coordinates(cent_muni)
+
+pts <- terra::vect(
+  data.frame(
+    x = xy[, 1],
+    y = xy[, 2]
+  ),
+  geom = c("x", "y"),
+  crs = st_crs(muni_base)$wkt
+)
+
+extraccion_expo <- terra::extract(raster_expo_final, pts)
+
+muni_base$expo_rbf_bc <- extraccion_expo[, 2]
+
+summary(muni_base$expo_rbf_bc)
+sum(is.na(muni_base$expo_rbf_bc))
+
+#---------------------------------------------------------
+# 3. CONTROL DE EXTREMOS DESPUÉS DE EXTRAER
+#---------------------------------------------------------
+# Se recortan los valores extraídos entre percentil 1 y 99.
+# Esto evita que valores extremos dominen el índice,
+# pero conserva mejor la variabilidad que recortar el raster completo antes.
+
+q_expo <- quantile(
+  muni_base$expo_rbf_bc,
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+q_expo
+
+muni_base <- muni_base %>%
+  mutate(
+    expo_rbf_bc_w = pmin(
+      pmax(expo_rbf_bc, q_expo[1]),
+      q_expo[2]
+    )
+  )
+
+summary(muni_base$expo_rbf_bc_w)
+
+#---------------------------------------------------------
+# 4. NORMALIZAR EXPOSICIÓN RBF BOX-COX
+#---------------------------------------------------------
+
+muni_base <- muni_base %>%
+  mutate(
+    expo_norm_rbf = norm01(expo_rbf_bc_w)
+  )
+
+summary(muni_base$expo_norm_rbf)
+
+#---------------------------------------------------------
+# 5. VERIFICAR VARIABLES DEL ÍNDICE
+#---------------------------------------------------------
+
+summary(muni_base$ISE)
+summary(muni_base$indice_fisico)
+summary(muni_base$expo_norm_rbf)
+
+colSums(
+  is.na(
+    st_drop_geometry(
+      muni_base[, c("ISE", "indice_fisico", "expo_norm_rbf")]
+    )
+  )
+)
+
+#---------------------------------------------------------
+# 6. CONSTRUIR ÍNDICE DE VULNERABILIDAD TOTAL
+#---------------------------------------------------------
+# Pesos:
+# ISE = 40 %
+# índice físico = 35 %
+# exposición RBF Box-Cox normalizada = 25 %
+
+muni_base <- muni_base %>%
+  mutate(
+    vulnerabilidad_total = (
+      0.40 * ISE +
+        0.35 * indice_fisico +
+        0.25 * expo_norm_rbf
+    )
+  )
+
+summary(muni_base$vulnerabilidad_total)
+sum(is.na(muni_base$vulnerabilidad_total))
+
+#---------------------------------------------------------
+# 7. CLASIFICAR VULNERABILIDAD EN 5 CATEGORÍAS
+#---------------------------------------------------------
+
+labels_vuln <- c("Muy baja", "Baja", "Media", "Alta", "Muy alta")
+
+quiebres <- quantile(
+  muni_base$vulnerabilidad_total,
+  probs = seq(0, 1, 0.2),
+  na.rm = TRUE
+)
+
+quiebres
+
+# Clasificación robusta:
+# Si los quiebres son únicos, se usa cut().
+# Si hay quiebres repetidos, se usa ntile().
+
+if (length(unique(quiebres)) == 6) {
+  
+  muni_base <- muni_base %>%
+    mutate(
+      vuln_clase = cut(
+        vulnerabilidad_total,
+        breaks = quiebres,
+        include.lowest = TRUE,
+        labels = labels_vuln
+      )
+    )
+  
+} else {
+  
+  muni_base$vuln_rank <- NA_integer_
+  
+  idx_valid <- !is.na(muni_base$vulnerabilidad_total)
+  
+  muni_base$vuln_rank[idx_valid] <- dplyr::ntile(
+    muni_base$vulnerabilidad_total[idx_valid],
+    5
+  )
+  
+  muni_base$vuln_clase <- factor(
+    labels_vuln[muni_base$vuln_rank],
+    levels = labels_vuln
+  )
+  
+  muni_base$vuln_rank <- NULL
+}
+
+table(muni_base$vuln_clase, useNA = "ifany")
+
+#---------------------------------------------------------
+# 8. MAPA CONTINUO DE VULNERABILIDAD
+#---------------------------------------------------------
+
+plot(
+  muni_base["vulnerabilidad_total"],
+  main = "Índice de vulnerabilidad total - Tibú"
+)
+
+
+#---------------------------------------------------------
+# 9. MAPA CLASIFICADO DE VULNERABILIDAD
+#---------------------------------------------------------
+
+plot(
+  muni_base["vuln_clase"],
+  main = "Clasificación de vulnerabilidad total - Tibú"
+)
+
+
+#---------------------------------------------------------
+# 10. MAPAS CON TMAP
+#---------------------------------------------------------
+
+tmap_mode("plot")
+
+mapa_vuln_continuo <- tm_shape(muni_base) +
+  tm_fill(
+    col = "vulnerabilidad_total",
+    palette = "YlOrRd",
+    style = "quantile",
+    title = "Índice de vulnerabilidad"
+  ) +
+  tm_borders() +
+  tm_layout(
+    title = "Índice de vulnerabilidad total - Tibú",
+    legend.outside = TRUE
+  )
+
+mapa_vuln_continuo
+
+mapa_vuln_clase <- tm_shape(muni_base) +
+  tm_fill(
+    col = "vuln_clase",
+    title = "Clase de vulnerabilidad"
+  ) +
+  tm_borders() +
+  tm_layout(
+    title = "Clasificación de vulnerabilidad total - Tibú",
+    legend.outside = TRUE
+  )
+
+mapa_vuln_clase
+
+#---------------------------------------------------------
+# 11. IDENTIFICAR ZONAS CRÍTICAS
+#---------------------------------------------------------
+# Zonas críticas = Alta + Muy alta
+
+zonas_criticas <- muni_base %>%
+  filter(vuln_clase %in% c("Alta", "Muy alta"))
+
+n_zonas_criticas <- nrow(zonas_criticas)
+
+n_zonas_criticas
+
+#---------------------------------------------------------
+# 12. CALCULAR ÁREA DE ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+zonas_criticas <- zonas_criticas %>%
+  mutate(
+    area_ha = as.numeric(st_area(.)) / 10000
+  )
+
+area_total_critica <- sum(zonas_criticas$area_ha, na.rm = TRUE)
+
+area_total_critica
+
+#---------------------------------------------------------
+# 13. MAPA DE ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+plot(
+  st_geometry(limite_tibu),
+  col = "grey90",
+  border = "grey60",
+  main = "Zonas críticas de vulnerabilidad - Tibú"
+)
+
+plot(
+  zonas_criticas["vuln_clase"],
+  add = TRUE,
+  key.pos = 4
+)
+
+# Versión tmap
+mapa_zonas_criticas <- tm_shape(muni_base) +
+  tm_polygons(
+    col = "grey90",
+    border.col = "grey70",
+    title = "Base territorial"
+  ) +
+  tm_shape(zonas_criticas) +
+  tm_fill(
+    col = "vuln_clase",
+    title = "Zonas críticas"
+  ) +
+  tm_borders() +
+  tm_layout(
+    title = "Zonas críticas de vulnerabilidad - Tibú",
+    legend.outside = TRUE
+  )
+
+mapa_zonas_criticas
+
+#---------------------------------------------------------
+# 14. RESUMEN DE RESULTADOS
+#---------------------------------------------------------
+summary(muni_base$expo_rbf_bc)
+summary(muni_base$expo_rbf_bc_w)
+summary(muni_base$expo_norm_rbf)
+summary(muni_base$vulnerabilidad_total)
+table(muni_base$vuln_clase, useNA = "ifany")
+n_zonas_criticas
+area_total_critica
+
+#---------------------------------------------------------
+# 15. EXPORTAR RESULTADOS
+#---------------------------------------------------------
+
+st_write(
+  muni_base,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/muni_vulnerabilidad_total_RBF_BoxCox.gpkg",
+  delete_dsn = TRUE
+)
+
+st_write(
+  zonas_criticas,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/zonas_criticas_RBF_BoxCox.gpkg",
+  delete_dsn = TRUE
+)
+
+
+#=========================================================
+# FASE 8: CRUCE CON PBOT, USO Y COBERTURA Y ÁREAS DE ACTIVIDAD
+# ACTUALIZADO CON VULNERABILIDAD RBF - BOX COX
+#=========================================================
+#--------------------------------------------------------
+# 0. VERIFICACIONES INICIALES
+#---------------------------------------------------------
+
+# Verificar que ya exista vulnerabilidad_total y vuln_clase
+if (!"vulnerabilidad_total" %in% names(muni_base)) {
+  stop("No existe vulnerabilidad_total en muni_base. Primero debes correr la Fase 7.")
+}
+
+if (!"vuln_clase" %in% names(muni_base)) {
+  stop("No existe vuln_clase en muni_base. Primero debes clasificar la vulnerabilidad.")
+}
+
+# Función para detectar columnas aunque tengan nombres ligeramente distintos
+buscar_columna <- function(data, posibles_nombres) {
+  cols <- names(data)
+  encontrada <- posibles_nombres[posibles_nombres %in% cols]
+  
+  if (length(encontrada) == 0) {
+    return(NA_character_)
+  } else {
+    return(encontrada[1])
+  }
+}
+#---------------------------------------------------------
+# 1. CARGA DE DATOS
+#---------------------------------------------------------
+
+uso <- st_read(
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/USO Y COBERTURA/USO Y COBERTURA TIBU.shp"
+)
+
+areas <- st_read(
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/01_RAW_DATA/AREAS DE ACTIVIDAD/AREAS ACTIVIDAD TIBU RECORTADA.shp"
+)
+
+#---------------------------------------------------------
+# 2. HOMOLOGAR SISTEMA DE COORDENADAS Y VALIDAR GEOMETRÍAS
+#---------------------------------------------------------
+
+uso <- st_transform(uso, st_crs(muni_base))
+areas <- st_transform(areas, st_crs(muni_base))
+
+muni_base <- st_make_valid(muni_base)
+uso <- st_make_valid(uso)
+areas <- st_make_valid(areas)
+limite_tibu <- st_make_valid(limite_tibu)
+
+#---------------------------------------------------------
+# 3. IDENTIFICAR ZONAS CRÍTICAS DESDE muni_base
+#---------------------------------------------------------
+# Importante:
+# Primero se identifican las zonas críticas en muni_base.
+# Después se cruzan con uso/cobertura y PBOT.
+# Así evitamos calcular áreas sobre geometrías duplicadas por intersección.
+
+zonas_criticas_base <- muni_base %>%
+  filter(vuln_clase %in% c("Alta", "Muy alta"))
+
+n_zonas_criticas <- nrow(zonas_criticas_base)
+
+zonas_criticas_base <- zonas_criticas_base %>%
+  mutate(
+    area_ha = as.numeric(st_area(.)) / 10000
+  )
+
+area_total_critica <- sum(zonas_criticas_base$area_ha, na.rm = TRUE)
+
+n_zonas_criticas
+area_total_critica
+
+#---------------------------------------------------------
+# 4. CRUCE VULNERABILIDAD TOTAL - USO Y COBERTURA
+#---------------------------------------------------------
+
+vuln_uso <- suppressWarnings(
+  st_intersection(
+    muni_base %>% filter(!is.na(vulnerabilidad_total)),
+    uso
+  )
+)
+
+zonas_criticas_uso <- vuln_uso %>%
+  filter(vuln_clase %in% c("Alta", "Muy alta"))
+
+# Calcular área de cada fragmento intersectado
+zonas_criticas_uso <- zonas_criticas_uso %>%
+  mutate(
+    area_ha_int = as.numeric(st_area(.)) / 10000
+  )
+
+#---------------------------------------------------------
+# 5. DETECTAR COLUMNAS DE USO Y COBERTURA
+#---------------------------------------------------------
+
+names(zonas_criticas_uso)
+
+col_nivel1 <- buscar_columna(
+  zonas_criticas_uso,
+  c("nivel_1", "Nivel_1", "NIVEL_1", "NIVEL1", "nivel1")
+)
+
+col_nivel2 <- buscar_columna(
+  zonas_criticas_uso,
+  c("nivel_2", "Nivel_2", "NIVEL_2", "NIVEL2", "nivel2")
+)
+
+col_nivel3 <- buscar_columna(
+  zonas_criticas_uso,
+  c("nivel_3", "Nivel_3", "NIVEL_3", "NIVEL3", "nivel3")
+)
+
+col_nivel1
+col_nivel2
+col_nivel3
+
+#---------------------------------------------------------
+# 6. TABLAS DE USO Y COBERTURA EN ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+if (!is.na(col_nivel1)) {
+  tabla_nivel1 <- table(zonas_criticas_uso[[col_nivel1]])
+  print(tabla_nivel1)
+  
+  area_nivel1 <- zonas_criticas_uso %>%
+    st_drop_geometry() %>%
+    group_by(.data[[col_nivel1]]) %>%
+    summarise(
+      area_ha = sum(area_ha_int, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(area_ha))
+  
+  print(area_nivel1)
+}
+
+if (!is.na(col_nivel2)) {
+  tabla_nivel2 <- table(zonas_criticas_uso[[col_nivel2]])
+  print(tabla_nivel2)
+  
+  area_nivel2 <- zonas_criticas_uso %>%
+    st_drop_geometry() %>%
+    group_by(.data[[col_nivel2]]) %>%
+    summarise(
+      area_ha = sum(area_ha_int, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(area_ha))
+  
+  print(area_nivel2)
+}
+
+if (!is.na(col_nivel3)) {
+  tabla_nivel3 <- table(zonas_criticas_uso[[col_nivel3]])
+  print(tabla_nivel3)
+  
+  area_nivel3 <- zonas_criticas_uso %>%
+    st_drop_geometry() %>%
+    group_by(.data[[col_nivel3]]) %>%
+    summarise(
+      area_ha = sum(area_ha_int, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(area_ha))
+  
+  print(area_nivel3)
+}
+
+#---------------------------------------------------------
+# 7. CRUCE CON ÁREAS DE ACTIVIDAD PBOT
+#---------------------------------------------------------
+
+vuln_pot <- suppressWarnings(
+  st_intersection(
+    zonas_criticas_base,
+    areas
+  )
+)
+
+vuln_pot <- vuln_pot %>%
+  mutate(
+    area_ha_int = as.numeric(st_area(.)) / 10000
+  )
+
+names(vuln_pot)
+
+# Detectar columnas del PBOT / áreas de actividad
+col_uso_principal <- buscar_columna(
+  vuln_pot,
+  c("Uso_Princip", "Uso_Princi", "USO_PRINCI", "Uso_Principal", "uso_princip")
+)
+
+col_detalle <- buscar_columna(
+  vuln_pot,
+  c("Detalle_Us", "Detalle_Uso", "DETALLE_US", "Detalle", "detalle_us")
+)
+
+col_uso_principal
+col_detalle
+
+#---------------------------------------------------------
+# 8. TABLAS DE ÁREAS DE ACTIVIDAD EN ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+if (!is.na(col_uso_principal)) {
+  tabla_uso <- table(vuln_pot[[col_uso_principal]])
+  print(tabla_uso)
+  
+  area_uso <- vuln_pot %>%
+    st_drop_geometry() %>%
+    group_by(.data[[col_uso_principal]]) %>%
+    summarise(
+      area_ha = sum(area_ha_int, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(area_ha))
+  
+  print(area_uso)
+}
+
+if (!is.na(col_detalle)) {
+  tabla_detalle <- table(vuln_pot[[col_detalle]])
+  print(tabla_detalle)
+  
+  area_detalle <- vuln_pot %>%
+    st_drop_geometry() %>%
+    group_by(.data[[col_detalle]]) %>%
+    summarise(
+      area_ha = sum(area_ha_int, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(area_ha))
+  
+  print(area_detalle)
+}
+
+#---------------------------------------------------------
+# 9. MAPA DE VULNERABILIDAD TOTAL
+#---------------------------------------------------------
+
+tmap_mode("plot")
+
+mapa_vuln <- tm_shape(muni_base) +
+  tm_fill(
+    fill = "vulnerabilidad_total",
+    fill.scale = tm_scale_intervals(
+      style = "quantile",
+      values = "YlOrRd"
+    ),
+    fill.legend = tm_legend(
+      title = "Índice de vulnerabilidad"
+    )
+  ) +
+  tm_borders() +
+  tm_shape(limite_tibu) +
+  tm_borders(col = "black", lwd = 1) +
+  tm_title("Índice de vulnerabilidad total - Tibú") +
+  tm_layout(
+    legend.outside = TRUE
+  )
+
+mapa_vuln
+
+#---------------------------------------------------------
+# 10. MAPA DE CLASIFICACIÓN DE VULNERABILIDAD
+#---------------------------------------------------------
+
+mapa_clases <- tm_shape(muni_base) +
+  tm_fill(
+    fill = "vuln_clase",
+    fill.scale = tm_scale_categorical(
+      values = "YlOrRd"
+    ),
+    fill.legend = tm_legend(
+      title = "Clasificación"
+    )
+  ) +
+  tm_borders() +
+  tm_shape(limite_tibu) +
+  tm_borders(col = "black", lwd = 1) +
+  tm_title("Clasificación de vulnerabilidad total - Tibú") +
+  tm_layout(
+    legend.outside = TRUE
+  )
+
+mapa_clases
+
+#---------------------------------------------------------
+# 11. MAPA DE ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+mapa_zonas_criticas <- tm_shape(muni_base) +
+  tm_fill(
+    fill = "grey90"
+  ) +
+  tm_borders(col = "grey70") +
+  tm_shape(zonas_criticas_base) +
+  tm_fill(
+    fill = "vuln_clase",
+    fill.scale = tm_scale_categorical(
+      values = "YlOrRd"
+    ),
+    fill.legend = tm_legend(
+      title = "Zonas críticas"
+    )
+  ) +
+  tm_borders(col = "black", lwd = 0.4) +
+  tm_shape(limite_tibu) +
+  tm_borders(col = "black", lwd = 1) +
+  tm_title("Zonas críticas de vulnerabilidad - Tibú") +
+  tm_layout(
+    legend.outside = TRUE
+  )
+
+mapa_zonas_criticas
+
+#---------------------------------------------------------
+# 12. MAPA USO Y COBERTURA EN ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+if (!is.na(col_nivel1)) {
+  
+  mapa_uso_critico <- tm_shape(zonas_criticas_uso) +
+    tm_fill(
+      fill = col_nivel1,
+      fill.legend = tm_legend(
+        title = "Uso / cobertura"
+      )
+    ) +
+    tm_borders(col = "black", lwd = 0.3) +
+    tm_shape(limite_tibu) +
+    tm_borders(col = "black", lwd = 1) +
+    tm_title("Uso y cobertura del suelo en zonas críticas") +
+    tm_layout(
+      legend.outside = TRUE
+    )
+  
+  mapa_uso_critico
+}
+
+#---------------------------------------------------------
+# 13. MAPA ÁREAS DE ACTIVIDAD PBOT EN ZONAS CRÍTICAS
+#---------------------------------------------------------
+
+if (!is.na(col_uso_principal)) {
+  
+  mapa_pbot_critico <- tm_shape(vuln_pot) +
+    tm_fill(
+      fill = col_uso_principal,
+      fill.legend = tm_legend(
+        title = "Área de actividad"
+      )
+    ) +
+    tm_borders(col = "black", lwd = 0.3) +
+    tm_shape(limite_tibu) +
+    tm_borders(col = "black", lwd = 1) +
+    tm_title("Zonas críticas vs áreas de actividad PBOT - Tibú") +
+    tm_layout(
+      legend.outside = TRUE
+    )
+  
+  mapa_pbot_critico
+}
+
+#---------------------------------------------------------
+# 14. MAPA FINAL DE CONFLICTO TERRITORIAL
+#---------------------------------------------------------
+# Este mapa muestra las zonas críticas cruzadas con PBOT.
+# Si existe uso principal, se colorea por área de actividad.
+# Si no existe, se colorea por clase de vulnerabilidad.
+
+if (!is.na(col_uso_principal)) {
+  
+  mapa_conflicto_final <- tm_shape(muni_base) +
+    tm_fill(
+      fill = "grey90"
+    ) +
+    tm_borders(col = "grey80") +
+    tm_shape(vuln_pot) +
+    tm_fill(
+      fill = col_uso_principal,
+      fill.legend = tm_legend(
+        title = "Área de actividad PBOT"
+      )
+    ) +
+    tm_borders(col = "black", lwd = 0.4) +
+    tm_shape(limite_tibu) +
+    tm_borders(col = "black", lwd = 1.2) +
+    tm_title("Mapa final: vulnerabilidad crítica y PBOT - Tibú") +
+    tm_layout(
+      legend.outside = TRUE
+    )
+  
+} else {
+  
+  mapa_conflicto_final <- tm_shape(muni_base) +
+    tm_fill(
+      fill = "grey90"
+    ) +
+    tm_borders(col = "grey80") +
+    tm_shape(zonas_criticas_base) +
+    tm_fill(
+      fill = "vuln_clase",
+      fill.scale = tm_scale_categorical(
+        values = "YlOrRd"
+      ),
+      fill.legend = tm_legend(
+        title = "Vulnerabilidad"
+      )
+    ) +
+    tm_borders(col = "black", lwd = 0.4) +
+    tm_shape(limite_tibu) +
+    tm_borders(col = "black", lwd = 1.2) +
+    tm_title("Mapa final: zonas críticas de vulnerabilidad - Tibú") +
+    tm_layout(
+      legend.outside = TRUE
+    )
+}
+
+mapa_conflicto_final
+
+#---------------------------------------------------------
+# 15. EXPORTAR RESULTADOS ESPACIALES
+#---------------------------------------------------------
+
+st_write(
+  muni_base,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/muni_vulnerabilidad_total_RBF_BoxCox.gpkg",
+  delete_dsn = TRUE
+)
+
+st_write(
+  zonas_criticas_base,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/zonas_criticas_RBF_BoxCox.gpkg",
+  delete_dsn = TRUE
+)
+
+st_write(
+  zonas_criticas_uso,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/zonas_criticas_uso_cobertura_RBF_BoxCox.gpkg",
+  delete_dsn = TRUE
+)
+
+st_write(
+  vuln_pot,
+  "D:/DOCUMENTOS/NOVENO SEMESTRE/PROYECTO DE GRADO/02_PROCESSED_DATA/zonas_criticas_PBOT_RBF_BoxCox.gpkg",
+  delete_dsn = TRUE
+)
+
+#---------------------------------------------------------
+# 16. RESUMEN FINAL
+#---------------------------------------------------------
+cat("\nNúmero de zonas críticas:\n")
+print(n_zonas_criticas)
+
+cat("\nÁrea total crítica desde muni_base (ha):\n")
+print(area_total_critica)
+
+cat("\nTabla de vulnerabilidad:\n")
+print(table(muni_base$vuln_clase, useNA = "ifany"))
+
+cat("\nColumnas detectadas uso/cobertura:\n")
+print(c(
+  nivel_1 = col_nivel1,
+  nivel_2 = col_nivel2,
+  nivel_3 = col_nivel3
+))
+
+cat("\nColumnas detectadas PBOT:\n")
+print(c(
+  uso_principal = col_uso_principal,
+  detalle = col_detalle
+))
+
+cat("\nResumen vulnerabilidad total:\n")
+print(summary(muni_base$vulnerabilidad_total))
+
+cat("\nResumen área por nivel 1:\n")
+if (exists("area_nivel1")) print(area_nivel1)
+
+cat("\nResumen área PBOT uso principal:\n")
+if (exists("area_uso")) print(area_uso)
+
+cat("\nResumen área PBOT detalle:\n")
+if (exists("area_detalle")) print(area_detalle)
+
